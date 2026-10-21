@@ -4,9 +4,12 @@
 #include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <Update.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include <cstdio>
 #include <cstring>
 #include "web_server.h"
 #include "settings_store.h"
@@ -14,6 +17,7 @@
 #include "ftms_control.h"
 #include "config.h"
 #include "version.h"
+#include "update_check.h"
 
 #if DEBUG_LOG
   #define LOG(fmt, ...) Serial.printf(fmt "\n", ##__VA_ARGS__)
@@ -28,6 +32,7 @@ static char g_wifiModeBuf[16] = "connecting";
 static char g_ipBuf[16]       = "";
 static bool g_uploadAuthorized = false;
 static bool g_uploadSameOrigin = false;
+static bool g_uploadRejectedBusy = false;
 
 // ── Captive portal (hotspot mode only) ──────────────────────────────
 // Active only while the bridge is running its own fallback hotspot (no
@@ -320,6 +325,15 @@ static const char UPDATE_HTML_BODY_TOP[] PROGMEM = R"HTML(
 
 static const char UPDATE_HTML_BODY_BOTTOM[] PROGMEM = R"HTML(</p>
 
+  <fieldset>
+    <legend>Check GitHub for updates</legend>
+    <button type="button" id="checkUpdateBtn">Check for updates</button>
+    <p id="updateCheckState" class="hint"></p>
+    <pre id="updateNotes" class="hint" style="display:none;white-space:pre-wrap;max-height:200px;overflow:auto"></pre>
+    <button type="button" id="installUpdateBtn" style="display:none;margin-top:10px"></button>
+    <p id="updateInstallState" class="hint"></p>
+  </fieldset>
+
   <form method="POST" action="/update" enctype="multipart/form-data">
     <fieldset>
       <legend>New firmware (.bin)</legend>
@@ -331,6 +345,118 @@ static const char UPDATE_HTML_BODY_BOTTOM[] PROGMEM = R"HTML(</p>
     After the upload, the bridge restarts automatically.
   </p>
 </div>
+<script>
+(function(){
+  var checkBtn = document.getElementById('checkUpdateBtn');
+  var checkState = document.getElementById('updateCheckState');
+  var notes = document.getElementById('updateNotes');
+  var installBtn = document.getElementById('installUpdateBtn');
+  var installState = document.getElementById('updateInstallState');
+  var checkFails = 0;
+  var installFails = 0;
+
+  function pollCheck(){
+    fetch('/api/update-check', {cache:'no-store'}).then(function(r){ return r.json(); }).then(function(s){
+      checkFails = 0;
+      if (s.inProgress) { setTimeout(pollCheck, 700); return; }
+      checkBtn.disabled = false;
+      if (!s.hasResult) { checkState.textContent = ''; return; }
+      if (!s.ok) {
+        checkState.textContent = 'Check failed: ' + s.error;
+        checkState.style.color = 'var(--danger)';
+        return;
+      }
+      checkState.style.color = '';
+      if (!s.isNewer) {
+        checkState.textContent = 'Up to date (latest release: ' + s.latestVersion + ').';
+        return;
+      }
+      if (!s.hasAsset) {
+        checkState.textContent = 'A newer version (' + s.latestVersion +
+          ') is available, but no firmware file was found for this board.';
+        return;
+      }
+      checkState.textContent = 'Update available: ' + s.currentVersion + ' → ' + s.latestVersion;
+      if (s.releaseNotes) {
+        notes.textContent = s.releaseNotes;
+        notes.style.display = '';
+      }
+      installBtn.textContent = 'Install ' + s.latestVersion;
+      installBtn.style.display = '';
+    }).catch(function(){
+      checkFails++;
+      if (checkFails > 20) {
+        checkBtn.disabled = false;
+        checkState.textContent = 'Lost the connection to the bridge — please check it.';
+        return;
+      }
+      setTimeout(pollCheck, 700);
+    });
+  }
+
+  checkBtn.addEventListener('click', function(){
+    checkBtn.disabled = true;
+    installBtn.style.display = 'none';
+    notes.style.display = 'none';
+    checkState.style.color = '';
+    checkState.textContent = 'Checking GitHub…';
+    checkFails = 0;
+    fetch('/update/check', {method:'POST'}).then(function(){ pollCheck(); }).catch(function(){ pollCheck(); });
+  });
+
+  function pollInstall(){
+    fetch('/api/update-install', {cache:'no-store'}).then(function(r){ return r.json(); }).then(function(s){
+      installFails = 0;
+      if (!s.done) {
+        if (s.totalBytes > 0) {
+          installState.textContent = 'Installing… ' + Math.round(100 * s.bytesWritten / s.totalBytes) + '%';
+        } else if (s.bytesWritten > 0) {
+          installState.textContent = 'Installing… ' + s.bytesWritten + ' bytes';
+        } else {
+          installState.textContent = 'Starting download…';
+        }
+        setTimeout(pollInstall, 750);
+        return;
+      }
+      if (s.ok) {
+        installState.textContent = 'Update installed. The bridge is restarting now … ' +
+          "you'll be redirected automatically.";
+        installState.style.color = 'var(--success)';
+      } else {
+        installState.textContent = 'Update failed (' + s.error + '). The bridge is restarting back ' +
+          "into the previous firmware … you'll be redirected automatically.";
+        installState.style.color = 'var(--danger)';
+      }
+      setTimeout(function(){ location.href = '/update'; }, 15000);
+    }).catch(function(){
+      installFails++;
+      if (installFails > 20) {
+        installState.textContent = 'Lost the connection to the bridge — it may still be installing. Reload in a bit.';
+        return;
+      }
+      setTimeout(pollInstall, 750);
+    });
+  }
+
+  installBtn.addEventListener('click', function(){
+    installBtn.disabled = true;
+    checkBtn.disabled = true;
+    installState.style.color = '';
+    installState.textContent = 'Starting install…';
+    installFails = 0;
+    fetch('/update/install', {method:'POST'}).then(function(r){ return r.json(); }).then(function(s){
+      if (!s.started) {
+        installState.textContent = s.error || 'Could not start the install.';
+        installState.style.color = 'var(--danger)';
+        installBtn.disabled = false;
+        checkBtn.disabled = false;
+        return;
+      }
+      pollInstall();
+    }).catch(function(){ pollInstall(); });
+  });
+})();
+</script>
 </body>
 </html>
 )HTML";
@@ -1294,12 +1420,18 @@ static void handleDevicesScanPost() {
     g_httpServer.send(303, "text/plain", "");
 }
 
+// True while updateInstallTask() (further down) is downloading+flashing a
+// GitHub-sourced update — declared here so handleUpdateUpload() below can
+// refuse a manual upload while that's happening; both would otherwise
+// write to the same global Update instance at once.
+static bool updateInstallInProgress();
+
 // ── Firmware Update page (browser upload, no PlatformIO needed) ────
 static void handleUpdateGet() {
     if (!requireAuth()) return;
 
     String html;
-    html.reserve(1800);
+    html.reserve(6000);  // grew well past 1800 once the update-check/install UI+JS was added
     html += FPSTR(UPDATE_HTML_HEAD);
     html += FPSTR(PAGE_CSS);
     html += FPSTR(UPDATE_HTML_BODY_TOP);
@@ -1318,6 +1450,7 @@ static void handleUpdateUpload() {
         // body right now and can't safely write response headers.
         g_uploadAuthorized  = isAuthorized();
         g_uploadSameOrigin  = checkSameOrigin();
+        g_uploadRejectedBusy = false;
         if (!g_uploadAuthorized) {
             LOG("OTA(web): upload rejected (not authorized)");
             return;
@@ -1326,17 +1459,27 @@ static void handleUpdateUpload() {
             LOG("OTA(web): upload rejected (cross-origin request)");
             return;
         }
+        if (updateInstallInProgress()) {
+            // Both this and updateInstallTask() drive the same global
+            // Update instance -- refusing here (rather than racing) is
+            // simpler than trying to cancel an in-flight GitHub download.
+            // Vanishingly rare in practice, since that flow is also
+            // button-triggered from this same page.
+            g_uploadRejectedBusy = true;
+            LOG("OTA(web): upload rejected (a GitHub-sourced install is already running)");
+            return;
+        }
         LOG("OTA(web): receiving '%s'", upload.filename.c_str());
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
             Update.printError(Serial);
         }
     } else if (upload.status == UPLOAD_FILE_WRITE) {
-        if (!g_uploadAuthorized || !g_uploadSameOrigin) return;
+        if (!g_uploadAuthorized || !g_uploadSameOrigin || g_uploadRejectedBusy) return;
         if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
             Update.printError(Serial);
         }
     } else if (upload.status == UPLOAD_FILE_END) {
-        if (!g_uploadAuthorized || !g_uploadSameOrigin) return;
+        if (!g_uploadAuthorized || !g_uploadSameOrigin || g_uploadRejectedBusy) return;
         if (Update.end(true)) {
             LOG("OTA(web): update complete (%u bytes)", (unsigned)upload.totalSize);
         } else {
@@ -1346,6 +1489,13 @@ static void handleUpdateUpload() {
 }
 
 static void handleUpdateFinish() {
+    if (g_uploadRejectedBusy) {
+        g_httpServer.send(409, "text/plain",
+            "A firmware install started from the GitHub update check is already in "
+            "progress -- try the manual upload again once it's finished (the bridge "
+            "will have restarted).");
+        return;
+    }
     if (!g_uploadAuthorized) {
         // Upload was rejected in handleUpdateUpload() without touching the
         // response; this is the first safe point to send the 401 challenge.
@@ -1371,6 +1521,384 @@ static void handleUpdateFinish() {
     }
     delay(500);
     ESP.restart();
+}
+
+// ── Firmware Update page: "Check for updates" (GitHub) ───────────────
+// Queries the GitHub API for the latest release of this project, compares
+// it to FIRMWARE_VERSION, and resolves the download URL of the asset
+// matching this binary's own board (BOARD_ENV, see config.h/platformio.ini).
+// Async + poll, same shape as wifiTestTask()/pollWifiTest() above — a
+// multi-second HTTPS round trip must never block loop() (and with it the
+// web server and the BLE bridge), same reasoning as the WiFi test.
+struct UpdateCheckResult {
+    bool   inProgress        = false;
+    bool   hasResult         = false;
+    bool   ok                = false;  // fetch+parse succeeded
+    char   error[64]         = "";     // human-readable failure reason when !ok
+    char   latestVersion[32] = "";     // GitHub tag_name, e.g. "v1.2.0"
+    bool   isNewer           = false;
+    char   assetUrl[256]     = "";     // browser_download_url for BOARD_ENV's asset, "" if none
+    char   releaseNotes[600] = "";     // best-effort, may be empty or truncated
+};
+static SemaphoreHandle_t  g_updateCheckMutex = nullptr;
+static UpdateCheckResult  g_updateCheckResultState;
+
+// ── Firmware Update page: "Install" (download + flash the checked asset) ──
+struct UpdateInstallResult {
+    bool   inProgress  = false;
+    bool   done        = false;  // reached a terminal state (ok or failed)
+    bool   ok          = false;
+    char   error[96]   = "";
+    size_t bytesWritten = 0;
+    size_t totalBytes   = 0;     // 0 if unknown (no Content-Length)
+};
+static SemaphoreHandle_t    g_updateInstallMutex = nullptr;
+static UpdateInstallResult  g_updateInstallResultState;
+
+static bool updateCheckInProgress() {
+    bool running = false;
+    if (g_updateCheckMutex && xSemaphoreTake(g_updateCheckMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        running = g_updateCheckResultState.inProgress;
+        xSemaphoreGive(g_updateCheckMutex);
+    }
+    return running;
+}
+
+static bool updateInstallInProgress() {
+    bool running = false;
+    if (g_updateInstallMutex && xSemaphoreTake(g_updateInstallMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        running = g_updateInstallResultState.inProgress;
+        xSemaphoreGive(g_updateInstallMutex);
+    }
+    return running;
+}
+
+static UpdateCheckResult pollUpdateCheck() {
+    UpdateCheckResult out;
+    if (g_updateCheckMutex && xSemaphoreTake(g_updateCheckMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        out = g_updateCheckResultState;
+        xSemaphoreGive(g_updateCheckMutex);
+    }
+    return out;
+}
+
+static UpdateInstallResult pollUpdateInstall() {
+    UpdateInstallResult out;
+    if (g_updateInstallMutex && xSemaphoreTake(g_updateInstallMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        out = g_updateInstallResultState;
+        xSemaphoreGive(g_updateInstallMutex);
+    }
+    return out;
+}
+
+// Reads at most sizeof(buf)-1 bytes of `https`'s response body into `buf`
+// (null-terminating it), bounded by both the buffer size and `timeoutMs` —
+// used to cap how much of GitHub's /releases/latest JSON (which can run to
+// tens of KB once the auto-generated "body" field is included) is ever
+// held in RAM at once. tag_name/assets reliably appear well before body,
+// so a bounded read is enough to parse them; see update_check.h.
+static size_t readBoundedResponse(HTTPClient& https, char* buf, size_t bufSize, unsigned long timeoutMs) {
+    WiFiClient* stream = https.getStreamPtr();
+    size_t len = 0;
+    unsigned long start = millis();
+    while (len < bufSize - 1 && millis() - start < timeoutMs) {
+        size_t avail = stream->available();
+        if (avail == 0) {
+            if (!https.connected()) break;
+            delay(5);
+            continue;
+        }
+        size_t want = bufSize - 1 - len;
+        if (avail < want) want = avail;
+        int n = stream->readBytes(buf + len, want);
+        if (n <= 0) { delay(5); continue; }
+        len += (size_t)n;
+    }
+    buf[len] = '\0';
+    return len;
+}
+
+static void updateCheckTask(void* pvParameters) {
+    UpdateCheckResult result;
+
+    if (WiFi.status() != WL_CONNECTED) {
+        copyIntoField(result.error, sizeof(result.error),
+                      "No internet connection (configure Wi-Fi first)");
+    } else {
+        // GitHub's TLS certificate isn't validated here (setInsecure()) --
+        // the common, low-effort approach for ESP32 OTA, accepted
+        // deliberately: it means no protection against a man-in-the-middle
+        // on the path to GitHub, in exchange for not having to track/
+        // rotate a pinned CA cert on an embedded device. The binary is
+        // only ever flashed after a separate, explicit "Install" click
+        // (see updateInstallTask() below), never automatically. See also
+        // README's "Releasing new firmware versions" section.
+        WiFiClientSecure client;
+        client.setInsecure();
+        HTTPClient https;
+        https.setTimeout(10000);
+        if (https.begin(client, "https://api.github.com/repos/pjanfred/Bike2Watch/releases/latest")) {
+            https.addHeader("User-Agent", "Bike2Watch-Firmware");  // GitHub 403s without one
+            int code = https.GET();
+            if (code == 200) {
+                static char buf[8192];  // static: too big for this task's stack
+                size_t len = readBoundedResponse(https, buf, sizeof(buf), 10000);
+
+                if (extractJsonStringField(buf, len, "tag_name",
+                                            result.latestVersion, sizeof(result.latestVersion))) {
+                    result.ok      = true;
+                    result.isNewer = isNewerVersion(result.latestVersion, FIRMWARE_VERSION);
+                    findAssetDownloadUrl(buf, len, BOARD_ENV, result.assetUrl, sizeof(result.assetUrl));
+                    extractJsonStringField(buf, len, "body",
+                                            result.releaseNotes, sizeof(result.releaseNotes));
+                } else {
+                    copyIntoField(result.error, sizeof(result.error),
+                                  "Unexpected response from GitHub (couldn't find version)");
+                }
+            } else if (code == 403) {
+                copyIntoField(result.error, sizeof(result.error),
+                              "GitHub API rate limit hit -- try again later");
+            } else if (code > 0) {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "GitHub API returned HTTP %d", code);
+                copyIntoField(result.error, sizeof(result.error), msg);
+            } else {
+                copyIntoField(result.error, sizeof(result.error),
+                              "Couldn't reach GitHub (network error)");
+            }
+            https.end();
+        } else {
+            copyIntoField(result.error, sizeof(result.error), "Couldn't start HTTPS request");
+        }
+    }
+
+    result.inProgress = false;
+    result.hasResult  = true;
+    if (xSemaphoreTake(g_updateCheckMutex, portMAX_DELAY) == pdTRUE) {
+        g_updateCheckResultState = result;
+        xSemaphoreGive(g_updateCheckMutex);
+    }
+    vTaskDelete(nullptr);
+}
+
+// Starts updateCheckTask() unless one (or an install) is already running.
+// Never blocks the caller (the HTTP handler) waiting for the mutex --
+// requireAuth()/requireSameOrigin() already ran before this is called, so
+// there's nothing left to race on the response side.
+static void requestUpdateCheck() {
+    if (!g_updateCheckMutex) g_updateCheckMutex = xSemaphoreCreateMutex();
+    if (updateInstallInProgress()) return;
+
+    bool alreadyRunning = true;
+    if (xSemaphoreTake(g_updateCheckMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        alreadyRunning = g_updateCheckResultState.inProgress;
+        if (!alreadyRunning) {
+            g_updateCheckResultState = UpdateCheckResult();
+            g_updateCheckResultState.inProgress = true;
+        }
+        xSemaphoreGive(g_updateCheckMutex);
+    }
+    if (alreadyRunning) return;
+
+    xTaskCreatePinnedToCore(updateCheckTask, "updateCheck", 8192, nullptr, 1, nullptr, 0);
+}
+
+static void updateInstallTask(void* pvParameters) {
+    // Snapshot the asset URL resolved by the last successful check under
+    // its own mutex, rather than trusting anything the client could have
+    // sent -- see handleUpdateInstallPost() below for why a POST here
+    // never gets to name its own URL.
+    char url[256] = "";
+    if (xSemaphoreTake(g_updateCheckMutex, portMAX_DELAY) == pdTRUE) {
+        copyIntoField(url, sizeof(url), g_updateCheckResultState.assetUrl);
+        xSemaphoreGive(g_updateCheckMutex);
+    }
+
+    UpdateInstallResult result;
+
+    if (WiFi.status() != WL_CONNECTED) {
+        copyIntoField(result.error, sizeof(result.error), "No internet connection");
+    } else if (strlen(url) == 0) {
+        copyIntoField(result.error, sizeof(result.error), "No checked update to install");
+    } else {
+        WiFiClientSecure client;
+        client.setInsecure();  // see updateCheckTask() above for the trade-off note
+        HTTPClient https;
+        https.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);  // github.com -> objects.githubusercontent.com
+        https.setTimeout(15000);
+        if (https.begin(client, url)) {
+            https.addHeader("User-Agent", "Bike2Watch-Firmware");
+            int code = https.GET();
+            if (code == 200) {
+                int contentLength = https.getSize();
+                result.totalBytes = (contentLength > 0) ? (size_t)contentLength : 0;
+
+                if (!Update.begin(contentLength > 0 ? (size_t)contentLength : UPDATE_SIZE_UNKNOWN)) {
+                    Update.printError(Serial);
+                    copyIntoField(result.error, sizeof(result.error), "Couldn't start flash write");
+                } else {
+                    WiFiClient* stream = https.getStreamPtr();
+                    uint8_t chunk[2048];
+                    bool writeFailed = false;
+                    unsigned long lastActivity = millis();
+                    // -1 == unknown length -- read until the connection
+                    // closes rather than a byte count. connected() here
+                    // (same idiom the ESP32 core's own HTTPUpdate uses)
+                    // stays true as long as there's still buffered data to
+                    // read, even after the peer has sent its FIN, so this
+                    // can't drop the final in-flight chunk.
+                    int remaining = contentLength;
+
+                    while (https.connected() && (remaining > 0 || remaining == -1)) {
+                        size_t avail = stream->available();
+                        if (avail == 0) {
+                            if (millis() - lastActivity > 15000) break;  // stalled download
+                            delay(5);
+                            continue;
+                        }
+                        size_t want = avail < sizeof(chunk) ? avail : sizeof(chunk);
+                        int n = stream->readBytes(chunk, want);
+                        if (n <= 0) { delay(5); continue; }
+                        lastActivity = millis();
+
+                        if (Update.write(chunk, (size_t)n) != (size_t)n) {
+                            writeFailed = true;
+                            break;
+                        }
+                        result.bytesWritten += (size_t)n;
+                        if (remaining > 0) remaining -= n;
+
+                        if (xSemaphoreTake(g_updateInstallMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                            g_updateInstallResultState.bytesWritten = result.bytesWritten;
+                            g_updateInstallResultState.totalBytes   = result.totalBytes;
+                            xSemaphoreGive(g_updateInstallMutex);
+                        }
+                    }
+
+                    if (writeFailed) {
+                        Update.printError(Serial);
+                        copyIntoField(result.error, sizeof(result.error), "Write failed mid-download");
+                    } else if (remaining > 0) {
+                        copyIntoField(result.error, sizeof(result.error), "Download stalled or was cut short");
+                    } else if (!Update.end(true)) {
+                        Update.printError(Serial);
+                        copyIntoField(result.error, sizeof(result.error), "Incomplete or corrupt download");
+                    } else {
+                        result.ok = true;
+                        LOG("OTA(github): update complete (%u bytes)", (unsigned)result.bytesWritten);
+                    }
+                }
+            } else {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Download failed (HTTP %d)", code);
+                copyIntoField(result.error, sizeof(result.error), msg);
+            }
+            https.end();
+        } else {
+            copyIntoField(result.error, sizeof(result.error), "Couldn't start download");
+        }
+    }
+
+    result.inProgress = false;
+    result.done       = true;
+    if (xSemaphoreTake(g_updateInstallMutex, portMAX_DELAY) == pdTRUE) {
+        g_updateInstallResultState = result;
+        xSemaphoreGive(g_updateInstallMutex);
+    }
+
+    // Give the browser's poll loop a moment to observe done:true/ok before
+    // the reboot drops the connection -- unlike handleUpdateFinish()'s
+    // synchronous upload (whose HTTP response IS the "it's done" signal),
+    // nothing here blocks on a request/response, so the client only finds
+    // out via its next poll. Restarts either way, same as the manual
+    // upload flow: a failed Update.begin()/write()/end() never touches the
+    // currently-running app partition, so even a failed download reboots
+    // safely back into the still-intact previous firmware.
+    delay(2000);
+    ESP.restart();
+}
+
+// Starts updateInstallTask() unless one (or a check) is already running.
+static void requestUpdateInstall() {
+    if (!g_updateInstallMutex) g_updateInstallMutex = xSemaphoreCreateMutex();
+    if (updateCheckInProgress()) return;
+
+    bool alreadyRunning = true;
+    if (xSemaphoreTake(g_updateInstallMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        alreadyRunning = g_updateInstallResultState.inProgress;
+        if (!alreadyRunning) {
+            g_updateInstallResultState = UpdateInstallResult();
+            g_updateInstallResultState.inProgress = true;
+        }
+        xSemaphoreGive(g_updateInstallMutex);
+    }
+    if (alreadyRunning) return;
+
+    xTaskCreatePinnedToCore(updateInstallTask, "updateInstall", 8192, nullptr, 1, nullptr, 0);
+}
+
+static void handleUpdateCheckPost() {
+    if (!requireAuth()) return;
+    if (!requireSameOrigin()) return;
+    requestUpdateCheck();
+    g_httpServer.send(200, "application/json", "{\"started\":true}");
+}
+
+static void handleApiUpdateCheck() {
+    if (!requireAuth()) return;
+
+    UpdateCheckResult r = pollUpdateCheck();
+    String json;
+    json.reserve(900);
+    json += "{\"inProgress\":";    json += r.inProgress ? "true" : "false";
+    json += ",\"hasResult\":";     json += r.hasResult  ? "true" : "false";
+    json += ",\"ok\":";            json += r.ok         ? "true" : "false";
+    json += ",\"error\":\"";       json += jsonEscape(r.error); json += "\"";
+    json += ",\"currentVersion\":\""; json += FIRMWARE_VERSION; json += "\"";
+    json += ",\"latestVersion\":\"";  json += jsonEscape(r.latestVersion); json += "\"";
+    json += ",\"isNewer\":";       json += r.isNewer ? "true" : "false";
+    json += ",\"hasAsset\":";      json += (strlen(r.assetUrl) > 0) ? "true" : "false";
+    json += ",\"releaseNotes\":\""; json += jsonEscape(r.releaseNotes); json += "\"";
+    json += "}";
+
+    g_httpServer.send(200, "application/json", json);
+}
+
+static void handleUpdateInstallPost() {
+    if (!requireAuth()) return;
+    if (!requireSameOrigin()) return;
+
+    // Never act on a client-supplied URL -- only install the asset our own
+    // last successful check already resolved and validated against
+    // github.com/pjanfred/Bike2Watch's own release assets. This also
+    // enforces the two-step flow server-side: a bare POST here with no
+    // prior successful "Check for updates" simply fails.
+    UpdateCheckResult check = pollUpdateCheck();
+    if (!check.hasResult || !check.ok || strlen(check.assetUrl) == 0) {
+        g_httpServer.send(400, "application/json",
+            "{\"started\":false,\"error\":\"Check for updates first\"}");
+        return;
+    }
+
+    requestUpdateInstall();
+    g_httpServer.send(200, "application/json", "{\"started\":true}");
+}
+
+static void handleApiUpdateInstall() {
+    if (!requireAuth()) return;
+
+    UpdateInstallResult r = pollUpdateInstall();
+    String json;
+    json.reserve(200);
+    json += "{\"inProgress\":"; json += r.inProgress ? "true" : "false";
+    json += ",\"done\":";       json += r.done       ? "true" : "false";
+    json += ",\"ok\":";         json += r.ok         ? "true" : "false";
+    json += ",\"error\":\"";    json += jsonEscape(r.error); json += "\"";
+    json += ",\"bytesWritten\":"; json += String((unsigned long)r.bytesWritten);
+    json += ",\"totalBytes\":";   json += String((unsigned long)r.totalBytes);
+    json += "}";
+
+    g_httpServer.send(200, "application/json", json);
 }
 
 // Turns a WiFi.status() failure code into something a human can act on —
@@ -1682,6 +2210,10 @@ void setupWebServer(const Bike2WatchSettings& settings) {
     g_httpServer.on("/api/devices", HTTP_GET, handleApiDevices);
     g_httpServer.on("/update", HTTP_GET, handleUpdateGet);
     g_httpServer.on("/update", HTTP_POST, handleUpdateFinish, handleUpdateUpload);
+    g_httpServer.on("/update/check", HTTP_POST, handleUpdateCheckPost);
+    g_httpServer.on("/api/update-check", HTTP_GET, handleApiUpdateCheck);
+    g_httpServer.on("/update/install", HTTP_POST, handleUpdateInstallPost);
+    g_httpServer.on("/api/update-install", HTTP_GET, handleApiUpdateInstall);
     g_httpServer.onNotFound(handleNotFound);
     g_httpServer.begin();
     LOG("Web: dashboard server started on port 80");

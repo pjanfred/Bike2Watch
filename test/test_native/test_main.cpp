@@ -2,6 +2,7 @@
 #include <cstring>
 #include "bike2watch.h"
 #include "web_dashboard.h"
+#include "update_check.h"
 
 void setUp() {}
 void tearDown() {}
@@ -256,6 +257,120 @@ void test_status_json_too_small_buffer_returns_zero() {
     TEST_ASSERT_EQUAL(0, len);
 }
 
+// ── Firmware update: version comparison ──────────────────────────────
+void test_version_newer_patch() {
+    TEST_ASSERT_TRUE(isNewerVersion("v0.1.5", "0.1.4"));
+}
+
+void test_version_newer_minor() {
+    TEST_ASSERT_TRUE(isNewerVersion("v0.2.0", "0.1.9"));
+}
+
+void test_version_newer_major() {
+    TEST_ASSERT_TRUE(isNewerVersion("v1.0.0", "0.9.9"));
+}
+
+void test_version_equal_not_newer() {
+    TEST_ASSERT_FALSE(isNewerVersion("v0.1.4", "0.1.4"));
+}
+
+void test_version_older_not_newer() {
+    TEST_ASSERT_FALSE(isNewerVersion("v0.1.0", "0.1.4"));
+    TEST_ASSERT_FALSE(isNewerVersion("v0.0.9", "0.1.4"));
+}
+
+void test_version_leading_v_stripped() {
+    TEST_ASSERT_FALSE(isNewerVersion("v1.2.0", "1.2.0"));
+    TEST_ASSERT_TRUE(isNewerVersion("V1.2.1", "1.2.0"));
+}
+
+void test_version_missing_patch_defaults_zero() {
+    TEST_ASSERT_TRUE(isNewerVersion("v1.2", "1.1.9"));
+    TEST_ASSERT_FALSE(isNewerVersion("v1.2", "1.2.0"));
+}
+
+void test_version_garbage_not_newer() {
+    TEST_ASSERT_FALSE(isNewerVersion("not-a-version", "0.1.4"));
+    TEST_ASSERT_FALSE(isNewerVersion("", "0.1.4"));
+    TEST_ASSERT_FALSE(isNewerVersion(nullptr, "0.1.4"));
+}
+
+// ── Firmware update: bounded JSON field extraction ────────────────────
+void test_extract_json_string_field_basic() {
+    const char json[] = "{\"id\":1,\"tag_name\":\"v1.2.0\",\"name\":\"Release 1.2.0\"}";
+    char out[32];
+    TEST_ASSERT_TRUE(extractJsonStringField(json, strlen(json), "tag_name", out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("v1.2.0", out);
+}
+
+void test_extract_json_string_field_with_whitespace_after_colon() {
+    const char json[] = "{\"tag_name\": \"v1.2.0\"}";
+    char out[32];
+    TEST_ASSERT_TRUE(extractJsonStringField(json, strlen(json), "tag_name", out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("v1.2.0", out);
+}
+
+void test_extract_json_string_field_missing_key_returns_false() {
+    const char json[] = "{\"tag_name\":\"v1.2.0\"}";
+    char out[32] = "unchanged";
+    TEST_ASSERT_FALSE(extractJsonStringField(json, strlen(json), "body", out, sizeof(out)));
+}
+
+void test_extract_json_string_field_truncated_value_still_copies_partial() {
+    // Simulates web_server.cpp's bounded ~8KB read of GitHub's response
+    // being cut off mid-value (most relevant to the possibly-huge "body"
+    // field) -- the caller still gets back whatever was captured.
+    const char json[] = "{\"body\":\"Lorem ipsum dolor sit amet, this release note got cu";
+    char out[16];
+    TEST_ASSERT_TRUE(extractJsonStringField(json, strlen(json), "body", out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("Lorem ipsum dol", out);
+}
+
+void test_extract_json_string_field_unescapes_quotes_and_backslashes() {
+    const char json[] = "{\"body\":\"She said \\\"hi\\\" then C:\\\\path\"}";
+    char out[64];
+    TEST_ASSERT_TRUE(extractJsonStringField(json, strlen(json), "body", out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("She said \"hi\" then C:\\path", out);
+}
+
+// ── Firmware update: picking the right release asset for this board ──
+void test_find_asset_download_url_picks_matching_board() {
+    const char json[] =
+        "{\"name\":\"esp32-s3-devkitc-1 mentioned here too\","
+        "\"assets\":["
+        "{\"name\":\"bike2watch-esp32dev-v1.2.0.bin\","
+        "\"browser_download_url\":\"https://example.com/esp32dev.bin\"},"
+        "{\"name\":\"bike2watch-esp32-s3-devkitc-1-v1.2.0.bin\","
+        "\"browser_download_url\":\"https://example.com/s3.bin\"}"
+        "]}";
+    char out[128];
+
+    TEST_ASSERT_TRUE(findAssetDownloadUrl(json, strlen(json), "esp32dev", out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("https://example.com/esp32dev.bin", out);
+
+    TEST_ASSERT_TRUE(findAssetDownloadUrl(json, strlen(json), "esp32-s3-devkitc-1", out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("https://example.com/s3.bin", out);
+}
+
+void test_find_asset_download_url_ignores_top_level_release_name() {
+    // The release's own top-level "name" (its title, before "assets")
+    // mentions "esp32dev" -- must not be mistaken for an asset match.
+    const char json[] =
+        "{\"name\":\"esp32dev nightly build\","
+        "\"assets\":[{\"name\":\"bike2watch-esp32-s3-devkitc-1-v1.2.0.bin\","
+        "\"browser_download_url\":\"https://example.com/s3.bin\"}]}";
+    char out[128];
+    TEST_ASSERT_FALSE(findAssetDownloadUrl(json, strlen(json), "esp32dev", out, sizeof(out)));
+}
+
+void test_find_asset_download_url_no_match_returns_false() {
+    const char json[] =
+        "{\"assets\":[{\"name\":\"bike2watch-esp32dev-v1.2.0.bin\","
+        "\"browser_download_url\":\"https://example.com/esp32dev.bin\"}]}";
+    char out[128] = "unchanged";
+    TEST_ASSERT_FALSE(findAssetDownloadUrl(json, strlen(json), "esp32-s3-devkitc-1", out, sizeof(out)));
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     RUN_TEST(test_parse_too_short);
@@ -279,5 +394,21 @@ int main(int argc, char **argv) {
     RUN_TEST(test_status_json_defaults_no_pin_warning);
     RUN_TEST(test_status_json_escapes_device_name);
     RUN_TEST(test_status_json_too_small_buffer_returns_zero);
+    RUN_TEST(test_version_newer_patch);
+    RUN_TEST(test_version_newer_minor);
+    RUN_TEST(test_version_newer_major);
+    RUN_TEST(test_version_equal_not_newer);
+    RUN_TEST(test_version_older_not_newer);
+    RUN_TEST(test_version_leading_v_stripped);
+    RUN_TEST(test_version_missing_patch_defaults_zero);
+    RUN_TEST(test_version_garbage_not_newer);
+    RUN_TEST(test_extract_json_string_field_basic);
+    RUN_TEST(test_extract_json_string_field_with_whitespace_after_colon);
+    RUN_TEST(test_extract_json_string_field_missing_key_returns_false);
+    RUN_TEST(test_extract_json_string_field_truncated_value_still_copies_partial);
+    RUN_TEST(test_extract_json_string_field_unescapes_quotes_and_backslashes);
+    RUN_TEST(test_find_asset_download_url_picks_matching_board);
+    RUN_TEST(test_find_asset_download_url_ignores_top_level_release_name);
+    RUN_TEST(test_find_asset_download_url_no_match_returns_false);
     return UNITY_END();
 }

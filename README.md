@@ -52,9 +52,11 @@ If this project is useful to you, consider supporting its development:
   entities show up automatically, no manual YAML required. Also
   subscribes to a command topic to set the target resistance over MQTT —
   see "Setting a target resistance" below.
-- **OTA updates** — flash new firmware over the network, either via the
-  browser (`/update`, drag-and-drop a `.bin`) or via
-  `pio run -t upload --upload-port <hostname>.local`.
+- **OTA updates** — flash new firmware over the network: the Firmware
+  Update page (`/update`) can check GitHub directly for the latest release
+  and install it with two clicks (no manual download step), drag-and-drop
+  a `.bin` yourself, or use `pio run -t upload --upload-port
+  <hostname>.local`.
 - **Persistent settings** — WiFi, MQTT, wheel size and the admin password
   are stored in flash (NVS) and edited from the web UI; `config.h` only
   seeds the very first boot.
@@ -280,6 +282,20 @@ Download the `.bin` matching your board from the release, then flash it
 via the browser's Firmware Update page (`/update`) or network OTA — see
 "OTA updates" above. These are application-only images (no bootloader/
 partition table), matching what `/update` expects.
+
+The Firmware Update page can also do this for you: click **"Check for
+updates"** to have the bridge query GitHub directly for the latest
+release and compare it to the running version, then **"Install"** to
+download and flash the matching `.bin` automatically. The manual upload
+form below it still works the same way, e.g. for pre-release or
+locally-built binaries.
+
+This check talks to GitHub over HTTPS but skips certificate validation
+(`WiFiClientSecure::setInsecure()`) — the common, low-effort approach for
+ESP32 OTA. That means it has no protection against a man-in-the-middle on
+the network path to GitHub; acceptable here given the binary is only ever
+flashed after an explicit second "Install" click, but worth knowing if you
+run this bridge on a network you don't fully trust.
 
 ## Project structure
 
