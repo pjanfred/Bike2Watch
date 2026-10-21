@@ -6,6 +6,6 @@
 // firmware versions" in README.md) — it's not derived from the tag
 // automatically, since the tag only exists on the build machine's git
 // checkout, not inside the compiled binary.
-#define FIRMWARE_VERSION "0.1.4"
+#define FIRMWARE_VERSION "0.2.0"
 
 #endif // VERSION_H
