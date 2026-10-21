@@ -24,6 +24,17 @@
 #define LED_IS_RGB 0
 #endif
 
+// Identifies which PlatformIO environment (= which board) this binary was
+// built for, set via build_flags in platformio.ini. Used by the Firmware
+// Update page's "Check for updates" feature (see update_check.h /
+// web_server.cpp) to pick the matching .bin asset out of a GitHub release
+// that publishes one binary per board. Defaults to "esp32dev" so the
+// feature still degrades sensibly if ever built outside PlatformIO
+// without the flag, same spirit as the LED_PIN/LED_IS_RGB fallbacks above.
+#ifndef BOARD_ENV
+#define BOARD_ENV "esp32dev"
+#endif
+
 // Wheel circumference in mm — see Bike2WatchSettings::wheelCircumferenceMm in
 // settings.h for what it's actually used for.
 #define WHEEL_CIRCUMFERENCE_MM 2096
