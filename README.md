@@ -283,6 +283,19 @@ via the browser's Firmware Update page (`/update`) or network OTA — see
 "OTA updates" above. These are application-only images (no bootloader/
 partition table), matching what `/update` expects.
 
+One-time exception: versions from this point on build with a
+`min_spiffs` partition table (needed to fit HTTPClient/WiFiClientSecure's
+mbedTLS for the GitHub update check — this project doesn't use
+SPIFFS/LittleFS, so that partition's space goes to the app instead). A
+device still running a firmware built *before* this change has an old,
+smaller partition table physically in flash, so its first OTA update (via
+either `/update` path) to a `min_spiffs`-built image will safely fail
+(reported as "update failed", device stays on its current firmware, same
+guarantee as any other failed OTA write) because the new image no longer
+fits the old OTA partition size. That one device needs a single USB
+reflash (`pio run -t upload`) to pick up the new partition table; every
+OTA update after that works normally again.
+
 The Firmware Update page can also do this for you: click **"Check for
 updates"** to have the bridge query GitHub directly for the latest
 release and compare it to the running version, then **"Install"** to
