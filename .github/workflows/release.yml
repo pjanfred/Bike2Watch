@@ -1,0 +1,92 @@
+name: Release firmware
+
+# Builds firmware for every PlatformIO env and attaches the binaries to a
+# GitHub Release whenever a version tag (e.g. v1.2.0) is pushed. The .bin
+# files are application-only images (see src/web_server.cpp's /update
+# handler, which uses Update.begin(UPDATE_SIZE_UNKNOWN)) — flash them via
+# the browser Firmware Update page or `pio run -t upload`, no separate
+# bootloader/partition files needed.
+#
+# workflow_dispatch lets you (re-)run a release manually for a given tag
+# without having to push a new one — e.g. to verify the pipeline still
+# works, or to re-publish assets after a workflow fix.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to release (e.g. v1.2.0)"
+        required: true
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: version
+        run: echo "value=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify FIRMWARE_VERSION matches the release tag
+        run: |
+          tag="${{ steps.version.outputs.value }}"
+          expected="${tag#v}"
+          actual=$(grep -oP '(?<=FIRMWARE_VERSION ")[^"]+' include/version.h)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::include/version.h has FIRMWARE_VERSION \"$actual\" but the release tag is \"$tag\" (expected \"$expected\"). Bump FIRMWARE_VERSION before tagging — see README's \"Releasing new firmware versions\"."
+            exit 1
+          fi
+          echo "FIRMWARE_VERSION matches tag: $actual"
+
+  build:
+    needs: check-version
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [esp32dev, esp32-s3-devkitc-1]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO
+        run: pip install -U platformio
+
+      - name: Build firmware (${{ matrix.env }})
+        run: pio run -e ${{ matrix.env }}
+
+      - name: Rename firmware binary
+        run: |
+          cp ".pio/build/${{ matrix.env }}/firmware.bin" \
+             "bike2watch-${{ matrix.env }}-${{ needs.check-version.outputs.version }}.bin"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.env }}
+          path: bike2watch-${{ matrix.env }}-${{ needs.check-version.outputs.version }}.bin
+
+  release:
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-version.outputs.version }}
+          files: artifacts/*/*.bin
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
