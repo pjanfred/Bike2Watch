@@ -14,11 +14,7 @@
 #include "ota.h"
 #include "config.h"
 
-#if DEBUG_LOG
-  #define LOG(fmt, ...) Serial.printf(fmt "\n", ##__VA_ARGS__)
-#else
-  #define LOG(fmt, ...)
-#endif
+#include "log.h"
 
 // ── BLE UUIDs ────────────────────────────────────────────────────────
 static const NimBLEUUID FTMS_SERVICE_UUID((uint16_t)0x1826);
@@ -46,7 +42,11 @@ static volatile bool     g_hasPower        = false;
 static volatile bool     g_hasResistance   = false;
 
 // ── BLE client (bridge → bike) state ──────────────────────────────────
-static NimBLEAdvertisedDevice* g_targetDevice = nullptr;
+// The advertised device is only valid inside the scan callback (NimBLE
+// frees scan results when the next scan starts), so its address is copied
+// here and used to connect later instead of keeping the pointer.
+static NimBLEAddress           g_targetAddress;
+static volatile bool           g_hasTarget      = false;
 static volatile bool           g_wantsToConnect = false;
 static NimBLEClient*           g_bikeClient     = nullptr;
 
@@ -78,6 +78,9 @@ static const unsigned long BLE_RETRY_INTERVAL_MS = 5000;
 // clearPinnedDevice() and setupWebServer()'s own copy. g_settings.
 // pinnedBikeMac == "" is the default and means "no pin" — plug & play.
 static Bike2WatchSettings g_settings;
+// Guards g_settings.pinnedBikeMac/Name, which the web task writes and the
+// NimBLE host task reads (ScanCallbacks::onResult).
+static SemaphoreHandle_t g_pinMutex = nullptr;
 
 enum class ScanPurpose { AutoConnect, DiscoveryOnly };
 static volatile ScanPurpose g_scanPurpose = ScanPurpose::AutoConnect;
@@ -145,7 +148,7 @@ static void onBikeDataNotify(NimBLERemoteCharacteristic* characteristic,
                               uint8_t* data, size_t length, bool isNotify) {
     IndoorBikeData bikeData;
     if (!parseIndoorBikeData(data, length, bikeData)) {
-        LOG("FTMS: parse failed (%d bytes)", length);
+        LOG("FTMS: parse failed (%u bytes)", (unsigned)length);
         return;
     }
 
@@ -185,7 +188,7 @@ static void onBikeDataNotify(NimBLERemoteCharacteristic* characteristic,
 // (and a connect is only attempted) once the pinned MAC specifically
 // shows up; other FTMS devices are noted and ignored.
 // During a discovery-only scan (Settings/Bike page, while already
-// connected): never stops the scan or touches g_targetDevice/
+// connected): never stops the scan or touches g_targetAddress/
 // g_wantsToConnect at all — purely populates the cache for display.
 class ScanCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     void onResult(NimBLEAdvertisedDevice* device) override {
@@ -201,7 +204,10 @@ class ScanCallbacks : public NimBLEAdvertisedDeviceCallbacks {
             return;
         }
 
-        const char* pinnedMac = g_settings.pinnedBikeMac;
+        char pinnedMac[sizeof(g_settings.pinnedBikeMac)];
+        xSemaphoreTake(g_pinMutex, portMAX_DELAY);
+        copyIntoField(pinnedMac, sizeof(pinnedMac), g_settings.pinnedBikeMac);
+        xSemaphoreGive(g_pinMutex);
         if (pinnedMac[0] != '\0' && strcasecmp(pinnedMac, mac.c_str()) != 0) {
             // A device is pinned and this isn't it — keep scanning.
             return;
@@ -209,7 +215,8 @@ class ScanCallbacks : public NimBLEAdvertisedDeviceCallbacks {
 
         LOG("Scan: found FTMS device %s! RSSI=%d", mac.c_str(), device->getRSSI());
         NimBLEDevice::getScan()->stop();
-        g_targetDevice   = device;
+        g_targetAddress  = device->getAddress();
+        g_hasTarget      = true;
         g_wantsToConnect = true;
     }
 };
@@ -249,16 +256,16 @@ class WatchServerCallbacks : public NimBLEServerCallbacks {
 
 // ── Connect to the target FTMS device ─────────────────────────────────
 static bool connectToFtms() {
-    if (!g_targetDevice) return false;
+    if (!g_hasTarget) return false;
 
-    LOG("Connecting to %s...", g_targetDevice->getAddress().toString().c_str());
+    LOG("Connecting to %s...", g_targetAddress.toString().c_str());
 
     if (!g_bikeClient) {
         g_bikeClient = NimBLEDevice::createClient();
         g_bikeClient->setClientCallbacks(new BikeClientCallbacks());
     }
 
-    if (!g_bikeClient->connect(g_targetDevice)) {
+    if (!g_bikeClient->connect(g_targetAddress)) {
         LOG("Connection failed!");
         return false;
     }
@@ -438,7 +445,7 @@ static void bleClientTask(void* pvParameters) {
         // Discovery-only scan requested from the Settings/Bike page while
         // a bike is connected — the user already confirmed the warning
         // dialog. Runs independently of the g_bikeConnected branch below
-        // and never touches g_wantsToConnect/g_targetDevice (see
+        // and never touches g_wantsToConnect/g_targetAddress (see
         // ScanCallbacks::onResult), so it can't interfere with an
         // existing connection or trigger a reconnect to a different
         // device.
@@ -460,7 +467,7 @@ static void bleClientTask(void* pvParameters) {
                 g_bleRetryAtMs = 0;
             }
 
-            if (g_wantsToConnect && g_targetDevice) {
+            if (g_wantsToConnect && g_hasTarget) {
                 if (now >= g_bleRetryAtMs) {
                     g_wantsToConnect = false;
                     if (!connectToFtms()) {
@@ -619,8 +626,7 @@ static void checkResetButton() {
                 // the comment above).
                 if (heldMs >= LITE_MODE_EXIT_HOLD_MS && heldMs < RESET_BUTTON_HOLD_MS) {
                     LOG("Reset button: held %lums -> exiting Lite Mode", heldMs);
-                    g_settings.liteModeEnabled = false;
-                    saveSettings(g_settings);
+                    g_settings = updateSettings([](Bike2WatchSettings& s) { s.liteModeEnabled = false; });
                     setLed(true);
                     delay(300);
                     ESP.restart();
@@ -672,6 +678,7 @@ void setup() {
     LOG("%s starting...", DEVICE_NAME);
 
     g_discoveredDevicesMutex = xSemaphoreCreateMutex();
+    g_pinMutex = xSemaphoreCreateMutex();
 
     NimBLEDevice::init(DEVICE_NAME);
     setupBleServer();
@@ -775,7 +782,8 @@ void loop() {
                     g_cscMeasurement->setValue(cscBuf, cscLen);
                     g_cscMeasurement->notify();
                     LOG("CSC: wheelRevs=%lu crankRevs=%u",
-                        g_csc.cumulativeWheelRevs, g_csc.cumulativeCrankRevs);
+                        (unsigned long)g_csc.cumulativeWheelRevs,
+                        (unsigned)g_csc.cumulativeCrankRevs);
                 }
 
                 if (g_hasPower && g_cpMeasurement) {
@@ -827,12 +835,25 @@ void requestDiscoveryScanWhileConnected() {
     g_discoveryScanRequested = true;
 }
 
+// Pin changes go through updateSettings() (read-modify-write against flash)
+// so they don't clobber what the web UI saved since boot, and vice versa.
+// Only the pin fields of the cached g_settings are refreshed, under
+// g_pinMutex, since the BLE scan callback reads them from another task.
+static void applyPin(const char* mac, const char* name) {
+    updateSettings([&](Bike2WatchSettings& s) {
+        copyIntoField(s.pinnedBikeMac, sizeof(s.pinnedBikeMac), mac);
+        copyIntoField(s.pinnedBikeName, sizeof(s.pinnedBikeName), name);
+    });
+    xSemaphoreTake(g_pinMutex, portMAX_DELAY);
+    copyIntoField(g_settings.pinnedBikeMac, sizeof(g_settings.pinnedBikeMac), mac);
+    copyIntoField(g_settings.pinnedBikeName, sizeof(g_settings.pinnedBikeName), name);
+    xSemaphoreGive(g_pinMutex);
+}
+
 void setPinnedDevice(const char* mac, const char* name) {
-    copyIntoField(g_settings.pinnedBikeMac, sizeof(g_settings.pinnedBikeMac), mac ? mac : "");
-    copyIntoField(g_settings.pinnedBikeName, sizeof(g_settings.pinnedBikeName), name ? name : "");
-    saveSettings(g_settings);
+    applyPin(mac ? mac : "", name ? name : "");
     LOG("BLE: pinned to %s (%s)", g_settings.pinnedBikeMac, g_settings.pinnedBikeName);
-    // Deliberately doesn't touch g_targetDevice/g_wantsToConnect/
+    // Deliberately doesn't touch g_targetAddress/g_wantsToConnect/
     // disconnect anything: an existing connection (to a different device,
     // if any) keeps running. The pin is only consulted by
     // ScanCallbacks::onResult on the *next* scan, i.e. after the current
@@ -840,9 +861,7 @@ void setPinnedDevice(const char* mac, const char* name) {
 }
 
 void clearPinnedDevice() {
-    g_settings.pinnedBikeMac[0]  = '\0';
-    g_settings.pinnedBikeName[0] = '\0';
-    saveSettings(g_settings);
+    applyPin("", "");
     LOG("BLE: pin cleared, back to auto-connect");
 }
 

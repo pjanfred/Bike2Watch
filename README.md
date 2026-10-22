@@ -310,6 +310,27 @@ the network path to GitHub; acceptable here given the binary is only ever
 flashed after an explicit second "Install" click, but worth knowing if you
 run this bridge on a network you don't fully trust.
 
+## Testing beta builds
+
+Changes are first collected on the `beta` branch. Every push there runs the
+unit tests, builds firmware for both boards and publishes a GitHub
+**pre-release** named `v<version>-beta.<n>` (see
+`.github/workflows/beta.yml`), so you can try a change on real hardware
+before it is merged to `main` and released.
+
+1. Open the [Releases page](../../releases) and pick the newest pre-release.
+2. Download the `.bin` for your board (`esp32dev` or `esp32-s3-devkitc-1`)
+   and flash it via the web UI's Firmware Update page, or with
+   `pio run -t upload`. The `.sha256` file lets you verify the download.
+3. To go back, flash the latest stable (non-pre-release) release the same way.
+
+The firmware's built-in update check only looks at stable releases, so a
+beta is never offered automatically. The beta number is appended at build
+time; `include/version.h` is not edited. Only the 10 newest betas are kept.
+
+For serial logging use the `esp32dev-debug` / `esp32-s3-devkitc-1-debug`
+environments; the regular builds have logging compiled out.
+
 ## Project structure
 
 ```

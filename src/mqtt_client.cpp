@@ -8,11 +8,7 @@
 #include "ftms_control.h"
 #include "config.h"
 
-#if DEBUG_LOG
-  #define LOG(fmt, ...) Serial.printf(fmt "\n", ##__VA_ARGS__)
-#else
-  #define LOG(fmt, ...)
-#endif
+#include "log.h"
 
 static WiFiClient     g_wifiClient;
 static PubSubClient   g_mqttClient(g_wifiClient);

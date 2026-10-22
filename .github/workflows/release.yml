@@ -15,6 +15,7 @@ on:
   push:
     tags:
       - "v*.*.*"
+      - "!v*.*.*-*"   # pre-release tags are published by beta.yml
   workflow_dispatch:
     inputs:
       tag:
@@ -30,11 +31,15 @@ jobs:
       - uses: actions/checkout@v4
 
       - id: version
-        run: echo "value=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: echo "value=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Verify FIRMWARE_VERSION matches the release tag
+        env:
+          TAG: ${{ steps.version.outputs.value }}
         run: |
-          tag="${{ steps.version.outputs.value }}"
+          tag="$TAG"
           expected="${tag#v}"
           actual=$(grep -oP '(?<=FIRMWARE_VERSION ")[^"]+' include/version.h)
           if [ "$actual" != "$expected" ]; then
@@ -43,8 +48,18 @@ jobs:
           fi
           echo "FIRMWARE_VERSION matches tag: $actual"
 
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -U platformio
+      - run: pio test -e native
+
   build:
-    needs: check-version
+    needs: [check-version, test]
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -66,11 +81,15 @@ jobs:
         run: |
           cp ".pio/build/${{ matrix.env }}/firmware.bin" \
              "bike2watch-${{ matrix.env }}-${{ needs.check-version.outputs.version }}.bin"
+          sha256sum "bike2watch-${{ matrix.env }}-${{ needs.check-version.outputs.version }}.bin" \
+             > "bike2watch-${{ matrix.env }}-${{ needs.check-version.outputs.version }}.bin.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
           name: firmware-${{ matrix.env }}
-          path: bike2watch-${{ matrix.env }}-${{ needs.check-version.outputs.version }}.bin
+          path: |
+            bike2watch-${{ matrix.env }}-${{ needs.check-version.outputs.version }}.bin
+            bike2watch-${{ matrix.env }}-${{ needs.check-version.outputs.version }}.bin.sha256
 
   release:
     needs: [check-version, build]
@@ -86,7 +105,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.check-version.outputs.version }}
-          files: artifacts/*/*.bin
+          files: |
+            artifacts/*/*.bin
+            artifacts/*/*.sha256
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

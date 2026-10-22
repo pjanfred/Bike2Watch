@@ -5,11 +5,7 @@
 #include "ota.h"
 #include "config.h"
 
-#if DEBUG_LOG
-  #define LOG(fmt, ...) Serial.printf(fmt "\n", ##__VA_ARGS__)
-#else
-  #define LOG(fmt, ...)
-#endif
+#include "log.h"
 
 void setupOta(const Bike2WatchSettings& settings) {
     ArduinoOTA.setHostname(WEB_HOSTNAME);

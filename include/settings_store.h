@@ -1,6 +1,7 @@
 #ifndef SETTINGS_STORE_H
 #define SETTINGS_STORE_H
 
+#include <functional>
 #include "settings.h"
 
 // Loads settings from flash (NVS). On the very first boot ever (nothing
@@ -12,6 +13,13 @@ Bike2WatchSettings loadSettings();
 // Persists `settings` to flash (NVS). WiFi/MQTT/password changes take
 // effect after the next reboot.
 void saveSettings(const Bike2WatchSettings& settings);
+
+// Atomically applies `change` to the settings currently persisted in flash
+// and saves the result. Use this instead of modifying a long-lived copy
+// and calling saveSettings(): several tasks (web UI, BLE/main) own parts
+// of the settings, and saving a stale copy silently reverts whatever the
+// others changed since boot. Returns the settings as saved.
+Bike2WatchSettings updateSettings(const std::function<void(Bike2WatchSettings&)>& change);
 
 // Wipes every persisted setting (WiFi, MQTT, pinned bike, wheel size,
 // admin password) from flash. The next loadSettings() call — i.e. the

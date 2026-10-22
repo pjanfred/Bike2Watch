@@ -55,10 +55,56 @@ inline void parseVersionParts(const char* version, int out[3]) {
     }
 }
 
+// Returns the SemVer pre-release part of `version` ("beta.2" for
+// "v0.3.0-beta.2"), or nullptr for a plain release or unparseable input.
+inline const char* versionPrerelease(const char* version) {
+    if (!version) return nullptr;
+    const char* p = version;
+    if (*p == 'v' || *p == 'V') p++;
+    if (!isdigit((unsigned char)*p)) return nullptr;
+    while (isdigit((unsigned char)*p) || *p == '.') p++;
+    if (*p != '-' || p[1] == '\0') return nullptr;
+    return p + 1;
+}
+
+// Compares two pre-release strings per SemVer: dot-separated identifiers,
+// numeric ones compared as numbers ("beta.2" < "beta.10"), numeric lower
+// than alphanumeric, a shorter list lower when all earlier ones are equal.
+// Returns <0, 0 or >0.
+inline int comparePrerelease(const char* a, const char* b) {
+    while (*a || *b) {
+        if (!*a) return -1;
+        if (!*b) return 1;
+        bool aNum = isdigit((unsigned char)*a), bNum = isdigit((unsigned char)*b);
+        const char* aEnd = a; while (*aEnd && *aEnd != '.') aEnd++;
+        const char* bEnd = b; while (*bEnd && *bEnd != '.') bEnd++;
+        for (const char* q = a; q < aEnd; q++) if (!isdigit((unsigned char)*q)) aNum = false;
+        for (const char* q = b; q < bEnd; q++) if (!isdigit((unsigned char)*q)) bNum = false;
+        if (aNum && bNum) {
+            long av = 0, bv = 0;
+            for (const char* q = a; q < aEnd; q++) av = av * 10 + (*q - '0');
+            for (const char* q = b; q < bEnd; q++) bv = bv * 10 + (*q - '0');
+            if (av != bv) return av < bv ? -1 : 1;
+        } else if (aNum != bNum) {
+            return aNum ? -1 : 1;
+        } else {
+            size_t aLen = aEnd - a, bLen = bEnd - b;
+            int c = strncmp(a, b, aLen < bLen ? aLen : bLen);
+            if (c != 0) return c < 0 ? -1 : 1;
+            if (aLen != bLen) return aLen < bLen ? -1 : 1;
+        }
+        a = *aEnd ? aEnd + 1 : aEnd;
+        b = *bEnd ? bEnd + 1 : bEnd;
+    }
+    return 0;
+}
+
 // True only if `latestTag` (GitHub's `tag_name`, e.g. "v1.2.0") is a
 // strictly newer version than `currentVersion` (FIRMWARE_VERSION, e.g.
 // "1.2.0", no "v"). False for equal, older, or unparseable input — an
 // update flow that's unsure should never claim "update available".
+// Pre-releases sort before their release ("1.2.0-beta.3" < "1.2.0") and
+// among themselves per comparePrerelease().
 inline bool isNewerVersion(const char* latestTag, const char* currentVersion) {
     int latest[3];
     int current[3];
@@ -68,7 +114,12 @@ inline bool isNewerVersion(const char* latestTag, const char* currentVersion) {
     for (int i = 0; i < 3; i++) {
         if (latest[i] != current[i]) return latest[i] > current[i];
     }
-    return false;
+    const char* latestPre = versionPrerelease(latestTag);
+    const char* currentPre = versionPrerelease(currentVersion);
+    if (!latestPre && !currentPre) return false;
+    if (!latestPre) return true;      // release beats any pre-release
+    if (!currentPre) return false;
+    return comparePrerelease(latestPre, currentPre) > 0;
 }
 
 // Bounded, single-pass extraction of a top-level `"key":"value"` string
