@@ -6,6 +6,11 @@
 // firmware versions" in README.md) — it's not derived from the tag
 // automatically, since the tag only exists on the build machine's git
 // checkout, not inside the compiled binary.
+//
+// CI beta builds (.github/workflows/beta.yml) override it with
+// -D FIRMWARE_VERSION=\"<version>-beta.<n>\" instead of editing this file.
+#ifndef FIRMWARE_VERSION
 #define FIRMWARE_VERSION "0.2.1"
+#endif
 
 #endif // VERSION_H

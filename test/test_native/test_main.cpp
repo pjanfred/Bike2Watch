@@ -176,6 +176,19 @@ void test_csc_very_slow_speed_clamps_ticks() {
     TEST_ASSERT_EQUAL_UINT16(1024, cscTicksPerRev(1.0f));
 }
 
+void test_version_prerelease_ordering() {
+    TEST_ASSERT_TRUE(isNewerVersion("v1.2.0", "1.2.0-beta.3"));      // release > its beta
+    TEST_ASSERT_FALSE(isNewerVersion("v1.2.0-beta.3", "1.2.0"));     // beta < release
+    TEST_ASSERT_TRUE(isNewerVersion("v1.2.0-beta.10", "1.2.0-beta.2"));
+    TEST_ASSERT_FALSE(isNewerVersion("v1.2.0-beta.2", "1.2.0-beta.10"));
+    TEST_ASSERT_FALSE(isNewerVersion("v1.2.0-beta.2", "1.2.0-beta.2"));
+    TEST_ASSERT_TRUE(isNewerVersion("v1.3.0-beta.1", "1.2.0"));      // next minor beta > old release
+    TEST_ASSERT_TRUE(isNewerVersion("v1.2.0-rc.1", "1.2.0-beta.9")); // alpha order
+    TEST_ASSERT_NULL(versionPrerelease("1.2.0"));
+    TEST_ASSERT_NULL(versionPrerelease("not-a-version"));
+    TEST_ASSERT_EQUAL_STRING("beta.2", versionPrerelease("v1.2.0-beta.2"));
+}
+
 void test_mqtt_topic_prefix_validation() {
     TEST_ASSERT_TRUE(isValidMqttTopicPrefix("bike2watch"));
     TEST_ASSERT_TRUE(isValidMqttTopicPrefix("home/bike-2_watch"));
@@ -412,6 +425,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_csc_cadence_fractional);
     RUN_TEST(test_csc_speed_to_wheel_revs);
     RUN_TEST(test_csc_very_slow_speed_clamps_ticks);
+    RUN_TEST(test_version_prerelease_ordering);
     RUN_TEST(test_mqtt_topic_prefix_validation);
     RUN_TEST(test_csc_crank_event_time);
     RUN_TEST(test_csc_counters_wrap);
