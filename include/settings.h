@@ -58,4 +58,19 @@ inline void copyIntoField(char* dst, size_t dstSize, const char* src) {
     dst[dstSize - 1] = '\0';
 }
 
+// MQTT topic prefix: non-empty, printable ASCII without the MQTT wildcards
+// ('+', '#'), '"' or '\\' (which would break the hand-built Home Assistant
+// discovery JSON), spaces, and no leading/trailing '/'.
+inline bool isValidMqttTopicPrefix(const char* prefix) {
+    if (!prefix || prefix[0] == '\0') return false;
+    size_t len = strlen(prefix);
+    if (prefix[0] == '/' || prefix[len - 1] == '/') return false;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)prefix[i];
+        if (c <= ' ' || c >= 0x7F) return false;
+        if (c == '+' || c == '#' || c == '"' || c == '\\') return false;
+    }
+    return true;
+}
+
 #endif // SETTINGS_H

@@ -1,11 +1,18 @@
 #include <Preferences.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "settings_store.h"
 #include "config.h"
 
 // NVS namespace name (max 15 characters, an ESP-IDF limit).
 static const char* NVS_NAMESPACE = "bike2watch";
 
+// Serialises updateSettings()'s read-modify-write across tasks. Created in
+// loadSettings(), which setup() calls before any other task exists.
+static SemaphoreHandle_t g_settingsMutex = nullptr;
+
 Bike2WatchSettings loadSettings() {
+    if (!g_settingsMutex) g_settingsMutex = xSemaphoreCreateMutex();
     Bike2WatchSettings s;
 
     // Seeds from the compile-time ADMIN_PASSWORD; the prefs.getString()
@@ -15,7 +22,9 @@ Bike2WatchSettings loadSettings() {
     copyIntoField(s.adminPassword, sizeof(s.adminPassword), ADMIN_PASSWORD);
 
     Preferences prefs;
-    prefs.begin(NVS_NAMESPACE, /*readOnly=*/true);
+    // Opened read-write: a read-only open fails (with a noisy NVS error)
+    // when the namespace doesn't exist yet, i.e. on the very first boot.
+    prefs.begin(NVS_NAMESPACE, /*readOnly=*/false);
     bool hasSavedSettings = prefs.isKey("wifiSsid");
     if (hasSavedSettings) {
         prefs.getString("wifiSsid", s.wifiSsid, sizeof(s.wifiSsid));
@@ -79,6 +88,15 @@ void saveSettings(const Bike2WatchSettings& s) {
     prefs.putString("adminPass", s.adminPassword);
     prefs.putBool("liteMode", s.liteModeEnabled);
     prefs.end();
+}
+
+Bike2WatchSettings updateSettings(const std::function<void(Bike2WatchSettings&)>& change) {
+    if (g_settingsMutex) xSemaphoreTake(g_settingsMutex, portMAX_DELAY);
+    Bike2WatchSettings s = loadSettings();
+    change(s);
+    saveSettings(s);
+    if (g_settingsMutex) xSemaphoreGive(g_settingsMutex);
+    return s;
 }
 
 void factoryResetSettings() {

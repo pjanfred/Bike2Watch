@@ -126,6 +126,17 @@ inline bool parseIndoorBikeData(const uint8_t* data, size_t len, IndoorBikeData&
 // elapsed since the last call, so it stays correct even if a cycle is
 // skipped or delayed. A speed/cadence of exactly 0 intentionally leaves
 // the accumulator untouched rather than dividing by it.
+// Converts a revolution period in seconds to 1/1024 s ticks, clamped to the
+// uint16_t range. Casting an out-of-range float to an integer is undefined
+// behaviour, and a very slow wheel/crank (or a tiny rate) would otherwise
+// produce periods above 64 s.
+inline uint16_t cscTicksPerRev(float periodSec) {
+    float ticks = periodSec * 1024.0f;
+    if (!(ticks > 0.0f)) return 0;
+    if (ticks >= 65535.0f) return 65535;
+    return (uint16_t)ticks;
+}
+
 inline void updateCsc(CscAccumulator& csc, float speedKmh, float cadenceRpm, uint32_t deltaMs) {
     float deltaSec = deltaMs / 1000.0f;
     if (speedKmh > 0.0f) {
@@ -133,7 +144,7 @@ inline void updateCsc(CscAccumulator& csc, float speedKmh, float cadenceRpm, uin
         float distanceM = speedMs * deltaSec;
         csc.fractionalWheelRevs += distanceM / csc.wheelCircumferenceM;
         float wheelRevsPerSec = speedMs / csc.wheelCircumferenceM;
-        uint16_t ticksPerRev = (uint16_t)(1.0f / wheelRevsPerSec * 1024.0f);
+        uint16_t ticksPerRev = cscTicksPerRev(1.0f / wheelRevsPerSec);
         while (csc.fractionalWheelRevs >= 1.0f) {
             csc.cumulativeWheelRevs++;
             csc.fractionalWheelRevs -= 1.0f;
@@ -143,7 +154,7 @@ inline void updateCsc(CscAccumulator& csc, float speedKmh, float cadenceRpm, uin
     if (cadenceRpm > 0.0f) {
         float revsPerSec = cadenceRpm / 60.0f;
         csc.fractionalCrankRevs += revsPerSec * deltaSec;
-        uint16_t ticksPerRev = (uint16_t)(60.0f / cadenceRpm * 1024.0f);
+        uint16_t ticksPerRev = cscTicksPerRev(60.0f / cadenceRpm);
         while (csc.fractionalCrankRevs >= 1.0f) {
             csc.cumulativeCrankRevs++;
             csc.fractionalCrankRevs -= 1.0f;

@@ -19,11 +19,7 @@
 #include "version.h"
 #include "update_check.h"
 
-#if DEBUG_LOG
-  #define LOG(fmt, ...) Serial.printf(fmt "\n", ##__VA_ARGS__)
-#else
-  #define LOG(fmt, ...)
-#endif
+#include "log.h"
 
 static WebServer    g_httpServer(80);
 static Bike2WatchStatus g_status;
@@ -1146,60 +1142,77 @@ static void handleSettingsPost() {
     if (!requireAuth()) return;
     if (!requireSameOrigin()) return;
 
-    if (g_httpServer.hasArg("wifiSsid")) {
-        copyIntoField(g_settings.wifiSsid, sizeof(g_settings.wifiSsid),
-                          g_httpServer.arg("wifiSsid").c_str());
-    }
-    if (g_httpServer.hasArg("wifiPassword") && g_httpServer.arg("wifiPassword").length() > 0) {
-        copyIntoField(g_settings.wifiPassword, sizeof(g_settings.wifiPassword),
-                          g_httpServer.arg("wifiPassword").c_str());
-    }
-
+    // Validate first so an invalid value is reported instead of being
+    // silently dropped behind a "Saved." page.
     if (g_httpServer.hasArg("wheelCircMm")) {
+        // wheelCircumferenceM is a divisor in updateCsc() (see
+        // bike2watch.h), so 0/negative/nonsense must never get through.
         long circumference = g_httpServer.arg("wheelCircMm").toInt();
-        // Reject 0/negative/nonsense — wheelCircumferenceM is a divisor in
-        // updateCsc() (see bike2watch.h), so 0 would mean a division by
-        // zero on the very next speed update.
-        if (circumference >= 100 && circumference <= 5000) {
-            g_settings.wheelCircumferenceMm = (uint16_t)circumference;
+        if (circumference < 100 || circumference > 5000) {
+            g_httpServer.send(400, "text/plain", "Wheel circumference must be 100-5000 mm.");
+            return;
         }
-    }
-
-    g_settings.mqttEnabled = g_httpServer.hasArg("mqttEnabled");
-    if (g_httpServer.hasArg("mqttHost")) {
-        copyIntoField(g_settings.mqttHost, sizeof(g_settings.mqttHost),
-                          g_httpServer.arg("mqttHost").c_str());
     }
     if (g_httpServer.hasArg("mqttPort")) {
         long port = g_httpServer.arg("mqttPort").toInt();
-        if (port > 0 && port <= 65535) g_settings.mqttPort = (uint16_t)port;
+        if (port <= 0 || port > 65535) {
+            g_httpServer.send(400, "text/plain", "MQTT port must be 1-65535.");
+            return;
+        }
     }
-    if (g_httpServer.hasArg("mqttUser")) {
-        copyIntoField(g_settings.mqttUser, sizeof(g_settings.mqttUser),
-                          g_httpServer.arg("mqttUser").c_str());
+    if (g_httpServer.hasArg("mqttTopicPrefix") &&
+        !isValidMqttTopicPrefix(g_httpServer.arg("mqttTopicPrefix").c_str())) {
+        g_httpServer.send(400, "text/plain",
+            "MQTT topic prefix must not be empty, contain spaces, '+', '#', quotes or "
+            "backslashes, or start/end with '/'.");
+        return;
     }
-    if (g_httpServer.hasArg("mqttPassword") && g_httpServer.arg("mqttPassword").length() > 0) {
-        copyIntoField(g_settings.mqttPassword, sizeof(g_settings.mqttPassword),
+
+    // Read-modify-write against flash (not our cached copy) so a pin or
+    // Lite Mode change made elsewhere since boot isn't reverted.
+    g_settings = updateSettings([&](Bike2WatchSettings& s) {
+        if (g_httpServer.hasArg("wifiSsid")) {
+            copyIntoField(s.wifiSsid, sizeof(s.wifiSsid), g_httpServer.arg("wifiSsid").c_str());
+        }
+        if (g_httpServer.hasArg("wifiPassword") && g_httpServer.arg("wifiPassword").length() > 0) {
+            copyIntoField(s.wifiPassword, sizeof(s.wifiPassword),
+                          g_httpServer.arg("wifiPassword").c_str());
+        }
+        if (g_httpServer.hasArg("wheelCircMm")) {
+            s.wheelCircumferenceMm = (uint16_t)g_httpServer.arg("wheelCircMm").toInt();
+        }
+
+        s.mqttEnabled = g_httpServer.hasArg("mqttEnabled");
+        if (g_httpServer.hasArg("mqttHost")) {
+            copyIntoField(s.mqttHost, sizeof(s.mqttHost), g_httpServer.arg("mqttHost").c_str());
+        }
+        if (g_httpServer.hasArg("mqttPort")) {
+            s.mqttPort = (uint16_t)g_httpServer.arg("mqttPort").toInt();
+        }
+        if (g_httpServer.hasArg("mqttUser")) {
+            copyIntoField(s.mqttUser, sizeof(s.mqttUser), g_httpServer.arg("mqttUser").c_str());
+        }
+        if (g_httpServer.hasArg("mqttPassword") && g_httpServer.arg("mqttPassword").length() > 0) {
+            copyIntoField(s.mqttPassword, sizeof(s.mqttPassword),
                           g_httpServer.arg("mqttPassword").c_str());
-    }
-    if (g_httpServer.hasArg("mqttTopicPrefix")) {
-        copyIntoField(g_settings.mqttTopicPrefix, sizeof(g_settings.mqttTopicPrefix),
+        }
+        if (g_httpServer.hasArg("mqttTopicPrefix")) {
+            copyIntoField(s.mqttTopicPrefix, sizeof(s.mqttTopicPrefix),
                           g_httpServer.arg("mqttTopicPrefix").c_str());
-    }
+        }
 
-    if (g_httpServer.hasArg("removeAdminPassword")) {
-        // Checked before the field below on purpose: an empty
-        // adminPassword field alone means "leave unchanged" (same
-        // convention as the WiFi/MQTT passwords), so actually clearing it
-        // needs this explicit checkbox rather than just submitting the
-        // form with the field left blank.
-        g_settings.adminPassword[0] = '\0';
-    } else if (g_httpServer.hasArg("adminPassword") && g_httpServer.arg("adminPassword").length() > 0) {
-        copyIntoField(g_settings.adminPassword, sizeof(g_settings.adminPassword),
+        if (g_httpServer.hasArg("removeAdminPassword")) {
+            // Checked before the field below on purpose: an empty
+            // adminPassword field alone means "leave unchanged" (same
+            // convention as the WiFi/MQTT passwords), so actually clearing it
+            // needs this explicit checkbox rather than just submitting the
+            // form with the field left blank.
+            s.adminPassword[0] = '\0';
+        } else if (g_httpServer.hasArg("adminPassword") && g_httpServer.arg("adminPassword").length() > 0) {
+            copyIntoField(s.adminPassword, sizeof(s.adminPassword),
                           g_httpServer.arg("adminPassword").c_str());
-    }
-
-    saveSettings(g_settings);
+        }
+    });
     LOG("Settings: saved via web UI, rebooting...");
 
     sendRestartingPage("Saved", "Saved.",
@@ -1221,8 +1234,7 @@ static void handleLiteModePost() {
     if (!requireAuth()) return;
     if (!requireSameOrigin()) return;
 
-    g_settings.liteModeEnabled = true;
-    saveSettings(g_settings);
+    g_settings = updateSettings([](Bike2WatchSettings& s) { s.liteModeEnabled = true; });
     LOG("Settings: Lite Mode activated via web UI, rebooting...");
 
     // Spells out the hold duration inline rather than pointing back at the

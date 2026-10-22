@@ -1,6 +1,7 @@
 #include <unity.h>
 #include <cstring>
 #include "bike2watch.h"
+#include "settings.h"
 #include "web_dashboard.h"
 #include "update_check.h"
 
@@ -161,6 +162,32 @@ void test_csc_custom_wheel_circumference() {
     updateCsc(csc, 3.6f, 0.0f, 1000);
     TEST_ASSERT_EQUAL_UINT32(1, csc.cumulativeWheelRevs);
     TEST_ASSERT_FLOAT_WITHIN(0.01f, 0.0f, csc.fractionalWheelRevs);
+}
+
+void test_csc_very_slow_speed_clamps_ticks() {
+    CscAccumulator csc;
+    csc.wheelCircumferenceM = 2.0f;
+    csc.fractionalWheelRevs = 0.99f;
+    // 0.01 km/h -> period far above 64 s; must clamp instead of overflowing.
+    updateCsc(csc, 0.01f, 0.0f, 60000);
+    TEST_ASSERT_TRUE(csc.cumulativeWheelRevs >= 1);
+    TEST_ASSERT_EQUAL_UINT16(65535, cscTicksPerRev(1000.0f));
+    TEST_ASSERT_EQUAL_UINT16(0, cscTicksPerRev(-1.0f));
+    TEST_ASSERT_EQUAL_UINT16(1024, cscTicksPerRev(1.0f));
+}
+
+void test_mqtt_topic_prefix_validation() {
+    TEST_ASSERT_TRUE(isValidMqttTopicPrefix("bike2watch"));
+    TEST_ASSERT_TRUE(isValidMqttTopicPrefix("home/bike-2_watch"));
+    TEST_ASSERT_FALSE(isValidMqttTopicPrefix(""));
+    TEST_ASSERT_FALSE(isValidMqttTopicPrefix(nullptr));
+    TEST_ASSERT_FALSE(isValidMqttTopicPrefix("a/#"));
+    TEST_ASSERT_FALSE(isValidMqttTopicPrefix("a/+/b"));
+    TEST_ASSERT_FALSE(isValidMqttTopicPrefix("a\"b"));
+    TEST_ASSERT_FALSE(isValidMqttTopicPrefix("a\\b"));
+    TEST_ASSERT_FALSE(isValidMqttTopicPrefix("has space"));
+    TEST_ASSERT_FALSE(isValidMqttTopicPrefix("/leading"));
+    TEST_ASSERT_FALSE(isValidMqttTopicPrefix("trailing/"));
 }
 
 void test_status_json_contains_expected_fields() {
@@ -384,6 +411,8 @@ int main(int argc, char **argv) {
     RUN_TEST(test_csc_cadence_accumulation);
     RUN_TEST(test_csc_cadence_fractional);
     RUN_TEST(test_csc_speed_to_wheel_revs);
+    RUN_TEST(test_csc_very_slow_speed_clamps_ticks);
+    RUN_TEST(test_mqtt_topic_prefix_validation);
     RUN_TEST(test_csc_crank_event_time);
     RUN_TEST(test_csc_counters_wrap);
     RUN_TEST(test_build_csc_crank_only);
